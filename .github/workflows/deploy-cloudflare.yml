@@ -61,73 +61,127 @@ jobs:
       - name: 🛠️ 设置环境 / Set up environment
         working-directory: ./mail-worker
         run: |
-          
           echo "🔐 Starting environment setup..."
-          
-          if [ -z "$JWT_SECRET" ] || grep -q '[?%#/\\]' <<< "$JWT_SECRET"; then
-            echo "❌ JWT_SECRET variable is empty or contains invalid characters (?, %, #, /, \\)."
-            exit 1
-          fi
-          
-          if ! jq -e 'type == "array"' <<< "$DOMAIN" ; then
-            echo "❌ DOMAIN variable must be a JSON array (e.g., [\"example.com\"])."
-            exit 1
-          fi
-          
-          if [ -z "$ADMIN" ]; then
-            echo "❌ ADMIN variable cannot be empty."
-            exit 1
-          fi
-          
-          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "❌ CLOUDFLARE_ACCOUNT_ID variable cannot be empty."
-            exit 1
-          fi
-          
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "❌ CLOUDFLARE_API_TOKEN variable cannot be empty."
-            exit 1
-          fi
-          
-          if [ -z "$CUSTOM_DOMAIN" ]; then
-            echo "::warning:: CUSTOM_DOMAIN variable is not set."
-          fi
-          
+
           CONFIG_FILE="wrangler-action.toml"
-          
-          if [ -z "$R2_BUCKET_NAME" ]; then
-            sed -i '/\[\[r2_buckets\]\]/,/^$/d' "$CONFIG_FILE"
-          fi
-          
-          if [ -z "$PROJECT_LINK" ]; then
-            sed -i '/^project_link = /d' "$CONFIG_FILE"
-          fi
-          
-          if [ -z "$CUSTOM_DOMAIN" ]; then
-            sed -i '/\[\[routes\]\]/,/^$/d' "$CONFIG_FILE"
-          fi
-          
-          if [ -n "$EMAIL" ]; then
-            cat >> "$CONFIG_FILE" <<'EOF'
 
-          [[send_email]]
-          name = "email"
-          EOF
+          python3 - "$CONFIG_FILE" <<'PY'
+          import json, os, sys
+
+          NL = chr(10)
+          CR = chr(13)
+          BOM = chr(65279)
+          BSLASH = chr(92)
+
+          cfg_path = sys.argv[1]
+
+          def get(name):
+              raw = os.environ.get(name)
+              if raw is None:
+                  return ""
+              return raw.replace(CR, NL).lstrip(BOM).strip()
+
+          KEYS = ["NAME", "CUSTOM_DOMAIN", "DOMAIN", "ADMIN", "JWT_SECRET",
+                  "R2_BUCKET_NAME", "PROJECT_LINK", "ANALYSIS_CACHE", "AI_MODEL",
+                  "EMAIL", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+                  "D1_DATABASE_ID", "KV_NAMESPACE_ID",
+                  "LINUXDO_CLIENT_ID", "LINUXDO_CLIENT_SECRET", "LINUXDO_CALLBACK_URL"]
+          v = {}
+          for k in KEYS:
+              v[k] = get(k)
+          if not v["NAME"]:
+              v["NAME"] = "cloud-mail"
+          if not v["ANALYSIS_CACHE"]:
+              v["ANALYSIS_CACHE"] = "false"
+          if not v["AI_MODEL"]:
+              v["AI_MODEL"] = "@cf/meta/llama-3.1-8b-instruct-fast"
+
+          errors = []
+          for k in KEYS:
+              if NL in v[k]:
+                  errors.append(k + " 含换行符（多行值），请在仓库 Secret 里改成单行")
+          if not v["JWT_SECRET"]:
+              errors.append("JWT_SECRET 为空")
+          else:
+              bad = set('?%#/|&"') | set(NL) | set(BSLASH) | set(" ") | set(chr(9))
+              hit = sorted(set(v["JWT_SECRET"]) & bad)
+              if hit:
+                  errors.append("JWT_SECRET 含非法字符 " + str(hit) + "，建议只用字母、数字、- 和 _")
+          if not v["ADMIN"]:
+              errors.append("ADMIN 为空")
+          if not v["CLOUDFLARE_ACCOUNT_ID"]:
+              errors.append("CLOUDFLARE_ACCOUNT_ID 为空")
+          if not v["CLOUDFLARE_API_TOKEN"]:
+              errors.append("CLOUDFLARE_API_TOKEN 为空")
+
+          domains = None
+          try:
+              domains = json.loads(v["DOMAIN"])
+              if not isinstance(domains, list) or not domains:
+                  raise ValueError
+          except Exception:
+              errors.append('DOMAIN 必须是 JSON 数组，例如 ["example.com"]')
+
+          if errors:
+              print("❌ 环境变量校验失败：")
+              for e in errors:
+                  print("   - " + e)
+              sys.exit(1)
+
+          if not v["CUSTOM_DOMAIN"]:
+              print("::warning:: CUSTOM_DOMAIN variable is not set.")
+
+          domain_json = json.dumps(domains, ensure_ascii=False)
+          text = open(cfg_path, encoding="utf-8").read()
+
+          def drop_section(src_text, header):
+              out = []
+              skip = False
+              for ln in src_text.split(NL):
+                  if ln.strip() == header:
+                      skip = True
+                      continue
+                  if skip:
+                      if ln.strip() == "":
+                          skip = False
+                      continue
+                  out.append(ln)
+              return NL.join(out)
+
+          if not v["R2_BUCKET_NAME"]:
+              text = drop_section(text, "[[r2_buckets]]")
+          if not v["CUSTOM_DOMAIN"]:
+              text = drop_section(text, "[[routes]]")
+          if not v["PROJECT_LINK"]:
+              kept = []
+              for ln in text.split(NL):
+                  if not ln.startswith("project_link = "):
+                      kept.append(ln)
+              text = NL.join(kept)
+
+          # 纯字面替换：不走正则、不用 sed 分隔符，彻底规避特殊字符导致的语法错误
+          text = text.replace('"${DOMAIN}"', domain_json)
+          text = text.replace("${DOMAIN}", domain_json)
+          for k in ["NAME", "CUSTOM_DOMAIN", "ADMIN", "JWT_SECRET", "R2_BUCKET_NAME",
+                    "PROJECT_LINK", "ANALYSIS_CACHE", "AI_MODEL",
+                    "LINUXDO_CLIENT_ID", "LINUXDO_CLIENT_SECRET", "LINUXDO_CALLBACK_URL"]:
+              text = text.replace("${" + k + "}", v[k])
+
+          if v["EMAIL"] and 'name = "email"' not in text:
+              text = text.rstrip(NL) + NL + NL + '[[send_email]]' + NL + 'name = "email"' + NL
+
+          f = open(cfg_path, "w", encoding="utf-8", newline=NL)
+          f.write(text)
+          f.close()
+          print("✅ 配置渲染完成（字面替换，无 sed 注入风险）")
+          print("   NAME=" + v["NAME"] + "  DOMAIN=" + domain_json)
+          PY
+
+          if [ ! -s "$CONFIG_FILE" ]; then
+            echo "❌ 配置渲染失败：$CONFIG_FILE 不存在或为空"
+            exit 1
           fi
 
-          sed -i "s|\${NAME}|${NAME}|g" "$CONFIG_FILE"
-          sed -i "s|\${CUSTOM_DOMAIN}|${CUSTOM_DOMAIN}|g" "$CONFIG_FILE"
-          sed -i "s|\"\${DOMAIN}\"|${DOMAIN}|g" "$CONFIG_FILE"
-          sed -i "s|\${ADMIN}|${ADMIN}|g" "$CONFIG_FILE"
-          sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" "$CONFIG_FILE"
-          sed -i "s|\${R2_BUCKET_NAME}|${R2_BUCKET_NAME}|g" "$CONFIG_FILE"
-          sed -i "s|\${PROJECT_LINK}|${PROJECT_LINK}|g" "$CONFIG_FILE"
-          sed -i "s|\${ANALYSIS_CACHE}|${ANALYSIS_CACHE}|g" "$CONFIG_FILE"
-          sed -i "s|\${AI_MODEL}|${AI_MODEL}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_CLIENT_ID}|${LINUXDO_CLIENT_ID}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_CLIENT_SECRET}|${LINUXDO_CLIENT_SECRET}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_CALLBACK_URL}|${LINUXDO_CALLBACK_URL}|g" "$CONFIG_FILE"
-          
           echo "✅ Environment setup completed."
 
       - name: ⚡ 设置KV数据库 / Set up KV database
